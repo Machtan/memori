@@ -6,6 +6,9 @@ version = "0.1.0"
 [dependencies]
 lazy_static = "0.2.2"
 regex = "0.2.1"
+serde = "0.9"
+serde_derive = "0.9"
+serde_json = "0.9"
 
 [dependencies.hangeul2]
 path = "../hangeul2"

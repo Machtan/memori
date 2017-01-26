@@ -5,13 +5,19 @@ extern crate hangeul2;
 extern crate regex;
 #[macro_use]
 extern crate lazy_static;
+#[macro_use]
+extern crate serde_derive;
+extern crate serde_json;
 
 use std::path::Path;
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::fs::File;
 use std_unicode::str::UnicodeStr;
 use regex::Regex;
+use std::env;
+use std::process;
+use std::error::Error;
 
 /*
 Where to find recognized unicode class names:
@@ -135,7 +141,7 @@ impl Source {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ColMeaning {
     pub text: String,
     pub symbol: Option<String>,
@@ -151,7 +157,7 @@ impl ColMeaning {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Collection {
     contents: HashMap<String, Vec<ColMeaning>>,
     titles: HashMap<u32, String>,
@@ -170,6 +176,10 @@ impl Collection {
             next_title_id: 0,
             empty: Vec::new(),
         }
+    }
+    
+    pub fn from_json(json: &str) -> serde_json::Result<Collection> {
+        serde_json::from_str(json)
     }
     
     fn ensure_title(&mut self, title: &str) -> u32 {
@@ -282,23 +292,82 @@ impl<'a> Insertion<'a> {
     }
 }
 
+fn print_usage(errno: Option<i32>) -> Option<i32> {
+    println!("Usage: memori integrate <collection.json> <source.txt> [<source.txt> ...]");
+    errno
+}
 
-fn main() {
-    let source_path = "../../../Desktop/memori/notes/lms_v1c2.txt";
-    let source = Source::load(source_path).expect("could not read source");
-    println!("Title: {}", source.title);
-    for note in &source.contents {
-        println!("- {:?}", note);
+fn run() -> Option<i32> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.len() < 3 {
+        return print_usage(Some(1));
     }
-    
-    let mut collection = Collection::new();
-    for note in &source.contents {
-        if let Some(insertion) = collection.insert(&note.term, &note.meaning, &source.title) {
-            println!("Decision time! ({}: {})", &note.term, note.meaning.text);
-            for (i, meaning) in insertion.meanings().iter().enumerate() {
-                println!("{}) {} ['{}']", i+1, meaning.text, insertion.title(meaning).unwrap());
+    if args[0] != "integrate" {
+        return print_usage(Some(1));
+    }
+    let colpath = &args[1];
+    let cpath = Path::new(colpath);
+    let mut collection = if ! cpath.exists() {
+        Collection::new()
+    } else {
+        let mut file = match File::open(&cpath) {
+            Ok(file) => file,
+            Err(err) => {
+                println!("Could not open collection file: '{}'", err.description());
+                return Some(2);
+            }
+        };
+        let mut json = String::new();
+        if let Err(err) = file.read_to_string(&mut json) {
+            println!("Could not read collection file: '{}'", err.description());
+            return Some(3);
+        }
+        match Collection::from_json(&json) {
+            Ok(col) => col,
+            Err(err) => {
+                println!("Could not parse collection JSON: '{}'", err.description());
+                return Some(4);
             }
         }
+    };
+    
+    for source_path in &args[2..] {
+        let source = match Source::load(source_path) {
+            Ok(s) => s,
+            Err(err) => {
+                println!("Could not read source at {}: {:?}", source_path, err);
+                return Some(5);
+            }
+        };
+        for note in &source.contents {
+            if let Some(insertion) = collection.insert(&note.term, &note.meaning, &source.title) {
+                println!("Decision time! ({}: {})", &note.term, note.meaning.text);
+                for (i, meaning) in insertion.meanings().iter().enumerate() {
+                    println!("{}) {} ['{}']", i+1, meaning.text, insertion.title(meaning).unwrap());
+                }
+            }
+        }
+    }
+    
+    let serialized = serde_json::to_string(&collection).unwrap();
+    let mut outfile = match File::create(&colpath) {
+        Ok(f) => f,
+        Err(err) => {
+            println!("Could not open collection for writing ('{}'): '{}'", colpath, err.description());
+            return Some(6);
+        }
+    };
+    if let Err(err) = outfile.write_all(serialized.as_bytes()) {
+        println!("Could not write to collection file ('{}'): '{}'", colpath, err.description());
+        return Some(6);
+    }
+    println!("Saved collection, yay!");
+    None
+}
+
+fn main() {
+    if let Some(errno) = run() {
+        process::exit(errno);
     }
 }
 
