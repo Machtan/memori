@@ -1,7 +1,11 @@
 [package]
+authors = ["Machtan <jako3047@gmail.com>"]
 name = "memori"
 version = "0.1.0"
-authors = ["Machtan <jako3047@gmail.com>"]
 
 [dependencies]
-hangeul2 = { path = "../hangeul2" }
+lazy_static = "0.2.2"
+regex = "0.2.1"
+
+[dependencies.hangeul2]
+path = "../hangeul2"
