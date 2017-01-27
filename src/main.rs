@@ -10,7 +10,7 @@ extern crate serde_derive;
 extern crate serde_json;
 
 use std::path::Path;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::fs::File;
 use std_unicode::str::UnicodeStr;
@@ -84,6 +84,7 @@ enum SourceScope {
     Vocab,
     ReadingExample,
     ReadingVocab,
+    Title,
 }
 
 lazy_static! {
@@ -105,7 +106,12 @@ impl Source {
         for (lineno, line) in text.lines().enumerate() {
             if line.starts_with("#") {
                 if let Some(m) = RE_TITLE.find(&line) {
-                    title = (&line[m.end()..]).trim().to_string();
+                    let rem = (&line[m.end()..]).trim();
+                    if rem != "" {
+                        title = rem.to_string();
+                    } else {
+                        scope = Title;
+                    }
                 } else if RE_READING.find(&line).is_some() {
                     scope = ReadingExample;
                 } else if RE_VOCABULARY.find(&line).is_some() {
@@ -119,6 +125,14 @@ impl Source {
                 continue;
             } else {
                 match scope {
+                    Title => {
+                        if line.is_whitespace() {
+                            continue;
+                        } else {
+                            title = line.trim().to_string();
+                            scope = Vocab;
+                        }
+                    }
                     Vocab | ReadingVocab => {
                         if let Some(note) = Note::from_line(&line) {
                             notes.push(note);
@@ -164,6 +178,7 @@ pub struct Collection {
     titles_rev: HashMap<String, u32>,
     next_title_id: u32,
     empty: Vec<ColMeaning>,
+    history: History,
 }
 
 impl Collection {
@@ -175,6 +190,7 @@ impl Collection {
             titles_rev: HashMap::new(),
             next_title_id: 0,
             empty: Vec::new(),
+            history: History::new(),
         }
     }
     
@@ -195,10 +211,16 @@ impl Collection {
     }
     
     /// Returns whether the insertion was succesful.
-    pub fn insert<'a>(&'a mut self, term: &'a str, meaning: &'a Meaning, source_title: &'a str) -> Option<Insertion<'a>> {
+    pub fn insert<'a>(&'a mut self, term: &'a str, meaning: Meaning, 
+            source_title: &'a str) -> Option<Insertion<'a>> {
+        if self.history.contains(term, &meaning.text) {
+            println!("HAPPILY IGNORING ({} => {})", term, meaning.text);
+            return None;
+        }
         if ! self.contents.contains_key(term) {
+            self.history.insert(term.to_string(), meaning.text.clone());
             let id = self.ensure_title(source_title);
-            let col_meaning = ColMeaning::new(meaning.clone(), id);
+            let col_meaning = ColMeaning::new(meaning, id);
             self.contents.insert(term.to_string(), vec![col_meaning]);
             return None;
         }
@@ -233,12 +255,14 @@ impl Collection {
 pub struct Insertion<'a> {
     collection: &'a mut Collection,
     term: &'a str,
-    meaning: &'a Meaning,
+    meaning: Meaning,
     source_title: &'a str,
 }
+
 impl<'a> Insertion<'a> {
     #[inline]
-    fn new(collection: &'a mut Collection, term: &'a str, meaning: &'a Meaning, source_title: &'a str) -> Insertion<'a> {
+    fn new(collection: &'a mut Collection, term: &'a str, meaning: Meaning,
+        source_title: &'a str) -> Insertion<'a> {
         Insertion {
             collection: collection,
             term: term,
@@ -257,11 +281,16 @@ impl<'a> Insertion<'a> {
         self.collection.titles.get(&meaning.source)
     }
     
-    pub fn reject(self) {}
+    pub fn forget(self) {}
+    
+    pub fn reject(self) {
+        self.collection.history.insert(self.term.to_string(), self.meaning.text);
+    }
     
     pub fn insert_new(mut self) {
+        self.collection.history.insert(self.term.to_string(), self.meaning.text.clone());
         let id = self.collection.ensure_title(self.source_title);
-        let meaning = ColMeaning::new(self.meaning.clone(), id);
+        let meaning = ColMeaning::new(self.meaning, id);
         self.collection.contents.get_mut(self.term).unwrap().push(meaning);
     }
     
@@ -269,6 +298,7 @@ impl<'a> Insertion<'a> {
         if index >= self.meanings().len() {
             Err(self)
         } else {
+            self.collection.history.insert(self.term.to_string(), self.meaning.text.clone());
             let id = self.collection.ensure_title(self.source_title);
             let mut meanings = self.collection.contents.get_mut(self.term).unwrap();
             let mut meaning = ColMeaning::new(self.meaning.clone(), id);
@@ -278,10 +308,12 @@ impl<'a> Insertion<'a> {
         }
     }
     
-    pub fn update_existing(mut self, index: usize, new_text: String) -> Result<(), Self> {
+    pub fn update_existing(mut self, index: usize, new_text: String)
+            -> Result<(), Self> {
         if index >= self.meanings().len() {
             Err(self)
         } else {
+            self.collection.history.insert(self.term.to_string(), self.meaning.text.clone());
             let id = self.collection.ensure_title(self.source_title);
             let mut meanings = self.collection.contents.get_mut(self.term).unwrap();
             let sym = self.meaning.symbol.clone().or_else(|| meanings[index].symbol.clone());
@@ -292,81 +324,156 @@ impl<'a> Insertion<'a> {
     }
 }
 
-fn print_usage(errno: Option<i32>) -> Option<i32> {
-    println!("Usage: memori integrate <collection.json> <source.txt> [<source.txt> ...]");
-    errno
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct History {
+    handled: HashMap<String, HashSet<String>>,
 }
 
-fn run() -> Option<i32> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    if args.len() < 3 {
-        return print_usage(Some(1));
+impl History {
+    #[inline]
+    pub fn new() -> History {
+        History {
+            handled: HashMap::new(),
+        }
     }
-    if args[0] != "integrate" {
-        return print_usage(Some(1));
+    
+    pub fn insert(&mut self, term: String, meaning: String) {
+        self.handled.entry(term).or_insert(HashSet::new()).insert(meaning);
     }
-    let colpath = &args[1];
+    
+    pub fn contains(&mut self, term: &str, meaning: &str) -> bool {
+        self.handled.get(term).map(|m| m.contains(meaning)).unwrap_or(false)
+    }
+}
+
+fn print_usage(errno: i32) -> Result<(), i32> {
+    println!("Usage: memori integrate <collection.json> <source.txt> [<source.txt> ...]");
+    if errno != 0 {
+        Err(errno)
+    } else {
+        Ok(())
+    }
+}
+
+fn integrate(collection: &mut Collection, source_paths: &[String]) -> Result<(), i32> {
+    for source_path in source_paths {
+        let source = match Source::load(source_path) {
+            Ok(s) => s,
+            Err(err) => {
+                println!("Could not read source at {}: {:?}", source_path, err);
+                return Err(5);
+            }
+        };
+        for note in &source.contents {
+            if let Some(insertion) = collection.insert(&note.term, note.meaning.clone(), &source.title) {
+                println!("Decision time! ({}: {})", &note.term, note.meaning.text);
+                for (i, meaning) in insertion.meanings().iter().enumerate() {
+                    println!("{}) {} ['{}']", i+1, meaning.text, insertion.title(meaning).unwrap());
+                }
+                println!("[a]dd [r]eplace [u]pdate [i]gnore");
+                loop {
+                    let mut answer = String::new();
+                    if let Err(err) = io::stdin().read_line(&mut answer) {
+                        println!("Error reading from stdin: '{}'", err.description());
+                        return Err(7);
+                    }
+                    let (cmd, rem) = if let Some(index) = answer.find(" ") {
+                        (&answer[..index], &answer[index+1..])
+                    } else {
+                        (answer.as_str(), "")
+                    };
+                    match cmd {
+                        "a" => {
+                            break;
+                        }
+                        "r" => {
+                            break;
+                        }
+                        "u" => {
+                            break;
+                        }
+                        "i" => {
+                            break;
+                        }
+                        _ => {
+                            println!("Unrecognized command: '{}'", cmd);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_collection(colpath: &str) -> Result<Collection, i32> {
     let cpath = Path::new(colpath);
-    let mut collection = if ! cpath.exists() {
+    Ok(if ! cpath.exists() {
         Collection::new()
     } else {
         let mut file = match File::open(&cpath) {
             Ok(file) => file,
             Err(err) => {
-                println!("Could not open collection file: '{}'", err.description());
-                return Some(2);
+                println!("Could not open collection file : '{}'", err.description());
+                return Err(2);
             }
         };
         let mut json = String::new();
         if let Err(err) = file.read_to_string(&mut json) {
             println!("Could not read collection file: '{}'", err.description());
-            return Some(3);
+            return Err(3);
         }
         match Collection::from_json(&json) {
             Ok(col) => col,
             Err(err) => {
                 println!("Could not parse collection JSON: '{}'", err.description());
-                return Some(4);
+                return Err(4);
             }
         }
-    };
-    
-    for source_path in &args[2..] {
-        let source = match Source::load(source_path) {
-            Ok(s) => s,
-            Err(err) => {
-                println!("Could not read source at {}: {:?}", source_path, err);
-                return Some(5);
-            }
-        };
-        for note in &source.contents {
-            if let Some(insertion) = collection.insert(&note.term, &note.meaning, &source.title) {
-                println!("Decision time! ({}: {})", &note.term, note.meaning.text);
-                for (i, meaning) in insertion.meanings().iter().enumerate() {
-                    println!("{}) {} ['{}']", i+1, meaning.text, insertion.title(meaning).unwrap());
-                }
-            }
-        }
-    }
-    
+    })
+}
+
+fn save_collection(collection: &mut Collection, colpath: &str) -> Result<(), i32> {
     let serialized = serde_json::to_string(&collection).unwrap();
     let mut outfile = match File::create(&colpath) {
         Ok(f) => f,
         Err(err) => {
             println!("Could not open collection for writing ('{}'): '{}'", colpath, err.description());
-            return Some(6);
+            return Err(6);
         }
     };
     if let Err(err) = outfile.write_all(serialized.as_bytes()) {
         println!("Could not write to collection file ('{}'): '{}'", colpath, err.description());
-        return Some(6);
+        return Err(6);
     }
     println!("Saved collection, yay!");
-    None
+    Ok(())
+}
+
+fn run() -> Result<(), i32> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.len() < 3 {
+        print_usage(1)?;
+    }
+    let ref cmd = args[0];
+    match cmd.as_str() {
+        "integrate" => {
+            let colpath = &args[1];
+            let source_paths = &args[2..];
+            let mut collection = load_collection(colpath)?;
+            integrate(&mut collection, source_paths)?;
+            save_collection(&mut collection, colpath)?;
+        }
+        _ => {
+            println!("Unsupported command");
+            print_usage(1)?;
+        }
+    }
+    Ok(())
 }
 
 fn main() {
-    if let Some(errno) = run() {
+    if let Err(errno) = run() {
         process::exit(errno);
     }
 }
